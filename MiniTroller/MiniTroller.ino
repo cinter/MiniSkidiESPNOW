@@ -1,7 +1,9 @@
 #include <esp_now.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
+#include <esp_system.h>
 
 Preferences preferences;
 
@@ -21,6 +23,8 @@ constexpr int sw3_B     = 10;
 Adafruit_NeoPixel pixel(1, neoPin, NEO_GRB + NEO_KHZ800);
 
 // --- System Variables ---
+RTC_DATA_ATTR int crashCounter = 0;
+
 enum SystemState { IDLE, PAIRING, PAIRED };
 SystemState currentState = IDLE;
 
@@ -311,8 +315,22 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  esp_reset_reason_t reason = esp_reset_reason();
+
+  if (reason == ESP_RST_BROWNOUT) {
+    crashCounter++;
+    if (crashCounter > 2) {
+      // We crashed 3 times in a row. The battery is completely dead.
+      // Go straight to deep sleep. Do NOT turn on the LED or Radio.
+      esp_deep_sleep_start();
+    }
+  } else {
+    // Normal boot or reset button press, clear the counter
+    crashCounter = 0;
+  }
+
   pixel.begin();
-  pixel.setBrightness(40);
+  pixel.setBrightness(5);
   pixel.show();
   rainbowStartup();
 
@@ -330,6 +348,8 @@ void setup() {
   esp_deep_sleep_enable_gpio_wakeup(1ULL << btnPower, ESP_GPIO_WAKEUP_GPIO_LOW);
 
   WiFi.mode(WIFI_STA);
+  // Drop from max power to ~8.5dBm. 
+  esp_wifi_set_max_tx_power(34); // 34 * 0.25dBm = 8.5dBm
   WiFi.disconnect();
 
   if (esp_now_init() != ESP_OK) {
