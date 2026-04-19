@@ -704,10 +704,10 @@ void setupDriveMotors()
     leftMotor0,
     leftMotor1,
     -1,
-    MCPWM_UNIT_0,
-    MCPWM_TIMER_1,
-    MCPWM1A,
-    MCPWM1B
+    MCPWM_UNIT_1,
+    MCPWM_TIMER_0,
+    MCPWM0A,
+    MCPWM0B
   };
 
   rightHw.pwm_freq_hz = MOTOR_PWM_FREQ_HZ;
