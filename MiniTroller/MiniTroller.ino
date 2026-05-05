@@ -5,9 +5,27 @@
 #include <Adafruit_NeoPixel.h>
 #include <esp_system.h>
 
+// =====================
+// Debug configuration
+// =====================
+// Set to 0 for normal use after testing.
+#define DEBUG_ENABLED 1
+
+constexpr unsigned long debugInputInterval = 500UL;
+
+#if DEBUG_ENABLED
+  #define DBG_BEGIN(baud) Serial.begin(baud)
+  #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
+  #define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DBG_BEGIN(baud) do {} while (false)
+  #define DBG_PRINTLN(...) do {} while (false)
+  #define DBG_PRINTF(...) do {} while (false)
+#endif
+
 Preferences preferences;
 
-// --- Pin Definitions (XIAO ESP32-C3) ---
+// --- Pin Definitions (Seeed Studio XIAO ESP32-C3) ---
 constexpr int pinX      = 2;
 constexpr int pinY      = 3;
 constexpr int btnPower  = 4;
@@ -45,6 +63,7 @@ constexpr unsigned long vehicleHeartbeatTimeout = 1500UL;
 unsigned long lastSendTime = 0;
 unsigned long pairingStartTime = 0;
 unsigned long lastLedUpdate = 0;
+unsigned long lastDebugInputPrint = 0;
 
 unsigned long btnPowerPressTime = 0;
 unsigned long btnLightsPressTime = 0;
@@ -94,8 +113,48 @@ struct __attribute__((packed)) ControlPacket {
 
 ControlPacket controlData = {};
 
+const char *stateName(SystemState state) {
+  switch (state) {
+    case IDLE:    return "IDLE";
+    case PAIRING: return "PAIRING";
+    case PAIRED:  return "PAIRED";
+    default:      return "UNKNOWN";
+  }
+}
+
+void printMAC(const uint8_t mac[6]) {
+#if DEBUG_ENABLED
+  Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+#endif
+}
+
+void logState(const char *message) {
+#if DEBUG_ENABLED
+  Serial.printf("[%lu] %s | state=%s slot=%d lights=%s\n",
+                millis(), message, stateName(currentState), activeReceiverSlot,
+                lightsAreOn ? "ON" : "OFF");
+#endif
+}
+
+void slotColour(uint8_t slot, uint8_t &r, uint8_t &g, uint8_t &b) {
+  if (slot == 1) {
+    r = 255;
+    g = 150;
+    b = 0;
+  } else {
+    r = 0;
+    g = 255;
+    b = 0;
+  }
+}
+
 // --- ESP-NOW Callbacks ---
 void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData, int len) {
+  if (recv_info == nullptr || incomingData == nullptr) {
+    return;
+  }
+
   if (len == 4 && memcmp(incomingData, "PAIR", 4) == 0) {
     portENTER_CRITICAL(&pairingMux);
     memcpy(pendingPeerMAC, recv_info->src_addr, sizeof(pendingPeerMAC));
@@ -110,9 +169,32 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *incomingData,
   }
 }
 
+void OnDataSent(const wifi_tx_info_t *txInfo, esp_now_send_status_t status) {
+#if DEBUG_ENABLED
+  static esp_now_send_status_t lastStatus = ESP_NOW_SEND_SUCCESS;
+
+  if (status != lastStatus) {
+    Serial.printf("[%lu] ESP-NOW send status changed: %s",
+                  millis(),
+                  status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+
+    if (txInfo != nullptr) {
+      Serial.print(" peer=");
+      printMAC(txInfo->des_addr);
+    }
+
+    Serial.println();
+    lastStatus = status;
+  }
+#else
+  (void)txInfo;
+  (void)status;
+#endif
+}
+
 // --- Logic Functions ---
 void enterPairingMode(unsigned long now) {
-  Serial.printf("Clearing Slot %d and entering Pairing Mode...\n", activeReceiverSlot);
+  DBG_PRINTF("[%lu] Clearing slot %d and entering pairing mode\n", now, activeReceiverSlot);
 
   const char *key = (activeReceiverSlot == 1) ? "peer_mac_1" : "peer_mac_2";
   preferences.remove(key);
@@ -146,15 +228,7 @@ void writeStatusLED() {
   uint8_t b = 0;
   bool isOn = true;
 
-  if (activeReceiverSlot == 1) {
-    r = 255;
-    g = 150;
-    b = 0;
-  } else {
-    r = 0;
-    g = 255;
-    b = 0;
-  }
+  slotColour(activeReceiverSlot, r, g, b);
 
   bool heartbeatTimedOut = false;
 
@@ -166,26 +240,26 @@ void writeStatusLED() {
     } else if (hbTime <= now) {
       heartbeatTimedOut = (now - hbTime > vehicleHeartbeatTimeout);
     } else {
-      // Callback updated hbTime after this loop iteration started.
-      // Treat as fresh, not timed out.
+      // millis() wrapped or callback updated hbTime after this loop iteration started.
+      // Treat as fresh rather than declaring a false timeout.
       heartbeatTimedOut = false;
     }
   }
 
-  if (currentState == PAIRED && heartbeatTimedOut) {
+  if (currentState == PAIRING) {
+    // Fast blink in the selected slot colour while listening for a receiver.
+    isOn = ((now / 150UL) % 2UL) != 0UL;
+  } else if (currentState == IDLE) {
+    // Empty active slot: short periodic blink in the selected slot colour.
+    // Slot 1 = amber. Slot 2 = green.
+    isOn = (now % 2000UL) < 120UL;
+  } else if (currentState == PAIRED && heartbeatTimedOut) {
+    // Paired but vehicle heartbeat missing: alternate selected slot colour with red.
     if ((now / 500UL) % 2UL != 0UL) {
       r = 255;
       g = 0;
       b = 0;
     }
-  }
-
-  if (currentState == PAIRING) {
-    isOn = ((now / 150UL) % 2UL) != 0UL;
-  } else if (currentState == IDLE) {
-    r = 5;
-    g = 5;
-    b = 5;
   }
 
   if (isOn) {
@@ -206,6 +280,8 @@ void rainbowStartup() {
 }
 
 void shutdownSequence() {
+  logState("Shutdown requested");
+
   while (digitalRead(btnPower) == LOW) {
     static int hue = 0;
     pixel.setPixelColor(0, pixel.gamma32(pixel.ColorHSV(hue)));
@@ -265,6 +341,8 @@ void calibrateJoystickCenter() {
   centerY = static_cast<int>(totalY / 64);
   smoothX = centerX;
   smoothY = centerY;
+
+  DBG_PRINTF("Joystick centre calibrated: X=%d Y=%d\n", centerX, centerY);
 }
 
 int normalizeAxis(int raw, int center) {
@@ -300,37 +378,105 @@ bool loadReceiverForSlot(int slot) {
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
 
-    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+    const esp_err_t addResult = esp_now_add_peer(&peerInfo);
+    if (addResult == ESP_OK) {
       currentState = PAIRED;
       lastVehicleHeartbeatTime = millis();  // short grace period until first HB arrives
+
+#if DEBUG_ENABLED
+      Serial.printf("[%lu] Loaded receiver for slot %d: ", millis(), slot);
+      printMAC(receiverMAC);
+      Serial.println();
+#endif
       return true;
     }
+
+    DBG_PRINTF("[%lu] Failed to add peer for slot %d, err=%d\n", millis(), slot, static_cast<int>(addResult));
+  } else {
+    DBG_PRINTF("[%lu] No saved receiver in slot %d\n", millis(), slot);
   }
 
   currentState = IDLE;
+  lastVehicleHeartbeatTime = 0;
   return false;
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
+void printDebugInputs(
+  unsigned long now,
+  int rawX,
+  int rawY,
+  int joyX,
+  int joyY,
+  bool pBtn,
+  bool lBtn
+) {
+#if DEBUG_ENABLED
+  if (now - lastDebugInputPrint < debugInputInterval) {
+    return;
+  }
+  lastDebugInputPrint = now;
 
-  esp_reset_reason_t reason = esp_reset_reason();
+  const unsigned long hbTime = lastVehicleHeartbeatTime;
+  const long hbAge = (hbTime == 0 || hbTime > now) ? -1L : static_cast<long>(now - hbTime);
+
+  Serial.printf(
+    "[%lu] state=%s slot=%d raw=(%d,%d) smooth=(%d,%d) joy=(%d,%d) "
+    "P=%d L=%d sw=%d%d %d%d %d%d lights=%d hbAge=%ldms\n",
+    now,
+    stateName(currentState),
+    activeReceiverSlot,
+    rawX,
+    rawY,
+    smoothX,
+    smoothY,
+    joyX,
+    joyY,
+    pBtn == LOW,
+    lBtn == LOW,
+    digitalRead(sw1_A) == LOW,
+    digitalRead(sw1_B) == LOW,
+    digitalRead(sw2_A) == LOW,
+    digitalRead(sw2_B) == LOW,
+    digitalRead(sw3_A) == LOW,
+    digitalRead(sw3_B) == LOW,
+    lightsAreOn ? 1 : 0,
+    hbAge
+  );
+#else
+  (void)now;
+  (void)rawX;
+  (void)rawY;
+  (void)joyX;
+  (void)joyY;
+  (void)pBtn;
+  (void)lBtn;
+#endif
+}
+
+void setup() {
+  DBG_BEGIN(115200);
+#if DEBUG_ENABLED
+  delay(1000);
+#endif
+
+  const esp_reset_reason_t reason = esp_reset_reason();
+  DBG_PRINTF("Boot reset reason: %d\n", static_cast<int>(reason));
 
   if (reason == ESP_RST_BROWNOUT) {
     crashCounter++;
     if (crashCounter > 2) {
-      // We crashed 3 times in a row. The battery is completely dead.
-      // Go straight to deep sleep. Do NOT turn on the LED or Radio.
+      // We crashed 3 times in a row. The battery is probably too low.
+      // Go straight to deep sleep. Do NOT turn on the LED or radio.
       esp_deep_sleep_start();
     }
   } else {
-    // Normal boot or reset button press, clear the counter
+    // Normal boot or reset button press; clear the counter.
     crashCounter = 0;
   }
 
   pixel.begin();
   pixel.setBrightness(5);
+  pixel.clear();
   pixel.show();
   rainbowStartup();
 
@@ -348,26 +494,47 @@ void setup() {
   esp_deep_sleep_enable_gpio_wakeup(1ULL << btnPower, ESP_GPIO_WAKEUP_GPIO_LOW);
 
   WiFi.mode(WIFI_STA);
-  // Drop from max power to ~8.5dBm. 
-  esp_wifi_set_max_tx_power(34); // 34 * 0.25dBm = 8.5dBm
+
+  // Drop from max power to about 8.5 dBm.
+  const esp_err_t txPowerResult = esp_wifi_set_max_tx_power(34); // 34 * 0.25 dBm = 8.5 dBm
+  if (txPowerResult != ESP_OK) {
+    DBG_PRINTF("esp_wifi_set_max_tx_power failed, err=%d\n", static_cast<int>(txPowerResult));
+  }
+
   WiFi.disconnect();
 
   if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW init failed");
+    DBG_PRINTLN("ESP-NOW init failed");
     currentState = IDLE;
     while (true) {
-      writeStatusLED();
-      delay(10);
+      // Red blink for radio init failure.
+      if ((millis() / 250UL) % 2UL == 0UL) {
+        pixel.setPixelColor(0, pixel.Color(255, 0, 0));
+      } else {
+        pixel.clear();
+      }
+      pixel.show();
+      delay(20);
     }
   }
 
   esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
 
-  preferences.begin("link-data", false);
-  activeReceiverSlot = preferences.getInt("active_slot", 1);
-  loadReceiverForSlot(activeReceiverSlot);
+  if (!preferences.begin("link-data", false)) {
+    DBG_PRINTLN("Preferences init failed; saved pairing slots unavailable");
+    currentState = IDLE;
+  } else {
+    activeReceiverSlot = preferences.getInt("active_slot", 1);
+    if (activeReceiverSlot != 1 && activeReceiverSlot != 2) {
+      activeReceiverSlot = 1;
+      preferences.putInt("active_slot", activeReceiverSlot);
+    }
+    loadReceiverForSlot(activeReceiverSlot);
+  }
 
   lastActivityTime = millis();
+  logState("Setup complete");
 }
 
 void loop() {
@@ -402,6 +569,8 @@ void loop() {
     currentMillis
   );
 
+  printDebugInputs(currentMillis, rawX, rawY, joyX, joyY, pBtn, lBtn);
+
   if (abs(smoothX - centerX) > joystickActivityThreshold ||
       abs(smoothY - centerY) > joystickActivityThreshold ||
       pBtn == LOW ||
@@ -413,43 +582,51 @@ void loop() {
     shutdownSequence();
   }
 
-  // Power Button (Slot swap / Sleep)
+  // Power Button (short press = slot swap, long press = sleep)
   if (pBtn == LOW && !lastPowerBtnPressed) {
     isPowerBtnHeld = true;
     btnPowerPressTime = currentMillis;
+    logState("Power button pressed");
   }
 
   if (pBtn == LOW && isPowerBtnHeld && (currentMillis - btnPowerPressTime >= holdTime)) {
+    logState("Power button long press");
     shutdownSequence();
   }
 
   if (pBtn == HIGH && lastPowerBtnPressed) {
+    logState("Power button released");
     if (isPowerBtnHeld) {
       activeReceiverSlot = (activeReceiverSlot == 1) ? 2 : 1;
       preferences.putInt("active_slot", activeReceiverSlot);
       loadReceiverForSlot(activeReceiverSlot);
+      logState("Active receiver slot changed");
     }
     isPowerBtnHeld = false;
   }
 
   lastPowerBtnPressed = (pBtn == LOW);
 
-  // Light Button (Lights / Pair)
+  // Light Button (short press = lights, long press = pair)
   if (lBtn == LOW && !lastLightsBtnPressed) {
     isLightsBtnHeld = true;
     lightsLongPressHandled = false;
     btnLightsPressTime = currentMillis;
+    logState("Lights button pressed");
   }
 
   if (lBtn == LOW && isLightsBtnHeld && !lightsLongPressHandled &&
       (currentMillis - btnLightsPressTime >= holdTime)) {
     enterPairingMode(currentMillis);
     lightsLongPressHandled = true;
+    logState("Lights button long press handled");
   }
 
   if (lBtn == HIGH && lastLightsBtnPressed) {
+    logState("Lights button released");
     if (isLightsBtnHeld && !lightsLongPressHandled) {
       lightsAreOn = !lightsAreOn;
+      logState(lightsAreOn ? "Lights toggled ON" : "Lights toggled OFF");
     }
     isLightsBtnHeld = false;
   }
@@ -484,17 +661,26 @@ void loop() {
       peerInfo.channel = 0;
       peerInfo.encrypt = false;
 
-      if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+      const esp_err_t addResult = esp_now_add_peer(&peerInfo);
+      if (addResult == ESP_OK) {
         currentState = PAIRED;
         lastVehicleHeartbeatTime = millis();  // short grace period until first HB arrives
+#if DEBUG_ENABLED
+        Serial.print("Paired with receiver: ");
+        printMAC(receiverMAC);
+        Serial.println();
+#endif
+        logState("Pairing complete");
       } else {
         currentState = IDLE;
         lastVehicleHeartbeatTime = 0;
+        DBG_PRINTF("Pairing failed: esp_now_add_peer err=%d\n", static_cast<int>(addResult));
       }
     }
   }
 
   if (currentState == PAIRING && (currentMillis - pairingStartTime >= pairingTimeout)) {
+    DBG_PRINTF("[%lu] Pairing timed out; reloading slot %d\n", currentMillis, activeReceiverSlot);
     loadReceiverForSlot(activeReceiverSlot);
   }
 
@@ -510,7 +696,14 @@ void loop() {
     controlData.sw3_B = (digitalRead(sw3_B) == LOW);
     controlData.lightsOn = lightsAreOn ? 1U : 0U;
 
-    esp_now_send(receiverMAC, reinterpret_cast<uint8_t *>(&controlData), sizeof(controlData));
+    const esp_err_t sendResult = esp_now_send(receiverMAC, reinterpret_cast<uint8_t *>(&controlData), sizeof(controlData));
+#if DEBUG_ENABLED
+    static esp_err_t lastSendResult = ESP_OK;
+    if (sendResult != ESP_OK && sendResult != lastSendResult) {
+      Serial.printf("[%lu] esp_now_send failed, err=%d\n", currentMillis, static_cast<int>(sendResult));
+    }
+    lastSendResult = sendResult;
+#endif
     lastSendTime = currentMillis;
   }
 
